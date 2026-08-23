@@ -63,14 +63,28 @@ export function supportedProtocols(): readonly string[] {
 }
 
 /**
+ * The key a keyless route authenticates with: the same literal pi-ai itself
+ * returns when an `Authorization` header carries a provider's auth, so the
+ * request stays inside the shape every pi-ai implementation already accepts.
+ * A local server ignores a bearer token it never asked for; an endpoint that
+ * demands real credentials answers 401, which is the honest report.
+ */
+const KEYLESS_API_KEY = 'unused'
+
+/**
  * Api-key auth for a route the harness authenticates itself. `Models` calls
  * this after the adapter has already resolved the route's credential, so a
  * missing key here is not this layer's failure: a named-but-unresolvable
  * reference has already failed the request with `MISSING_CREDENTIAL`, and a
- * route naming no credential at all is deliberately unauthenticated. Reporting
- * it as configured hands the decision to the protocol, which is where the
- * requirement actually lives — pi-ai's OpenAI-compatible implementation, for
- * one, still insists on a key or an `Authorization` header of its own.
+ * route naming no credential at all is keyless by intent. That intent is
+ * served, not refused: this method is the *only* auth a hand-declared route
+ * carries — pi-ai knows nothing about the route, so no provider-native
+ * ambient discovery exists to defer to — and every pi-ai implementation
+ * rejects a request bearing neither a key nor an `Authorization` header of
+ * its own. So a keyless route resolves {@link KEYLESS_API_KEY}, the placeholder
+ * pi-ai itself sanctions for header-carried auth, which makes a local server
+ * (the case a hand-declared keyless route overwhelmingly is) serve as
+ * configured while a misconfigured remote endpoint still fails loudly.
  * @param name - display name used as the resolution's status label.
  * @returns the api-key auth for a harness-authenticated route.
  */
@@ -78,7 +92,7 @@ function harnessApiKeyAuth(name: string): ApiKeyAuth {
   return {
     name,
     resolve: ({ credential }) => Promise.resolve({
-      auth: credential?.key === undefined ? {} : { apiKey: credential.key },
+      auth: { apiKey: credential?.key ?? KEYLESS_API_KEY },
       source: name,
     }),
   }
@@ -121,9 +135,11 @@ export interface ProviderSpec {
  * honouring the override), so an OAuth-only provider — `openai-codex` is the
  * one the installed catalog ships — would refuse a profile's explicit key with
  * `Provider is not configured` before any request went out. Adding the harness
- * method beside the provider's own restores that route. A keyless profile adds
- * nothing and still reports the honest refusal, because this adapter resolves
- * credentials through its own seam and holds no OAuth store to fall back on.
+ * method beside the provider's own restores that route; a catalog profile
+ * naming no credential keeps the provider's own auth untouched, ambient
+ * discovery and all. The keyless placeholder this method resolves therefore
+ * only ever reaches a hand-declared route, which is exactly the route with no
+ * other auth to its name.
  * @param spec - the resolved route facts.
  * @param catalog - the installed catalog provider, when pi-ai ships one.
  * @returns the auth to construct this route's provider with.

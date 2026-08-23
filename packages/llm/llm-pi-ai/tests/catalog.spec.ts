@@ -332,14 +332,16 @@ describe('hand-declared providers', () => {
     expect(() => buildProvider(spec)).toThrow(/cannot serve; supported protocols are/)
   })
 
-  it('leaves an unauthenticated route to its protocol rather than inventing a credential', async () => {
+  it('serves a keyless hand-declared route instead of refusing its first request', async () => {
     const server = await mockServer([{ events: textEvents }])
-    // Naming no credential is the deliberately unauthenticated posture — a
-    // named reference that resolved to nothing would have failed with
-    // MISSING_CREDENTIAL long before this point. The route resolves as
-    // configured and the protocol decides: pi-ai's OpenAI-compatible
-    // implementation wants a key or an Authorization header of its own, and
-    // says so instead of the harness guessing a placeholder.
+    // Naming no credential is the keyless posture — a named reference that
+    // resolved to nothing would have failed with MISSING_CREDENTIAL long
+    // before this point. A hand-declared route has no provider-native
+    // discovery to defer to, and pi-ai's implementations refuse a request
+    // bearing neither a key nor an Authorization header, so the harness
+    // resolves the same placeholder pi-ai itself sanctions when a header
+    // carries the auth: a local server ignores the token, and one that
+    // demands real credentials answers 401.
     const ctx = await harness({
       providers: {
         'local-llm': {
@@ -351,11 +353,27 @@ describe('hand-declared providers', () => {
     })
 
     const result = await assemble(ctx, { provider: 'local-llm', model: 'qwen3', messages: [] })
-    expect(result.finish).toMatchObject({
-      kind: 'error',
-      failure: { message: 'No API key for provider: local-llm' },
+    expect(result.finish).toEqual({ kind: 'stop' })
+    expect(result.message.content).toEqual([{ type: 'text', text: 'hello' }])
+    expect(server.headers[0]?.authorization).toBe('Bearer unused')
+  })
+
+  it('still sends a named credential in front of the keyless placeholder', async () => {
+    const server = await mockServer([{ events: textEvents }])
+    const ctx = await harness({
+      providers: {
+        'local-llm': {
+          apiKeyEnv: KEY_ENV,
+          api: 'openai-completions',
+          baseURL: `${server.url}/v1`,
+          models: [{ id: 'qwen3', contextWindow: 32_768, maxTokens: 2048 }],
+        },
+      },
     })
-    expect(server.requests).toHaveLength(0)
+
+    const result = await assemble(ctx, { provider: 'local-llm', model: 'qwen3', messages: [] })
+    expect(result.finish).toEqual({ kind: 'stop' })
+    expect(server.headers[0]?.authorization).toBe('Bearer test-key')
   })
 
   it('authenticates an unauthenticated route through a configured header', async () => {
