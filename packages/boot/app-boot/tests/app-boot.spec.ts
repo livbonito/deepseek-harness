@@ -8,7 +8,8 @@ import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import {
   addHarnessSourceSection, assertEntriesActivated, assertEntriesLoaded, boot,
   FAIL_LOUD_RELEASE_TIMEOUT_MS, HARNESS_SOURCE_SECTION,
-  installFailLoud, loadEnv, loadLayeredEnv, loadOverlayPatches, resolveConfigPath, type FailLoudProcess,
+  installFailLoud, loadEnv, loadLayeredEnv, loadOverlayPatches, registerFailLoudClaim, resolveConfigPath,
+  type FailLoudProcess,
 } from '../src/index.ts'
 
 const NAME = 'dsh-test-bin'
@@ -327,6 +328,35 @@ describe('installFailLoud', () => {
     expect(process.listenerCount('unhandledRejection')).toBe(before + 1)
     uninstallReal()
     expect(process.listenerCount('unhandledRejection')).toBe(before)
+  })
+
+  it('defers to a claimant that takes responsibility and stays fatal when one declines', () => {
+    const proc = fakeProc()
+    installFailLoud(NAME, proc)
+    const owned = new Error('sandbox escape')
+    const seen: unknown[] = []
+    const dispose = registerFailLoudClaim((reason) => {
+      seen.push(reason)
+      return reason === owned
+    })
+    try {
+      proc.handlers[0]!(owned)
+      expect(proc.written).toEqual([])
+      expect(proc.exits).toEqual([])
+      expect(seen).toEqual([owned])
+      // A declining claimant leaves the rejection fatal.
+      proc.handlers[0]!(new Error('nobody owns this one'))
+      expect(proc.written[0]).toContain('nobody owns this one')
+      expect(proc.exits).toEqual([1])
+    } finally {
+      dispose()
+    }
+    // After disposal no claimant matches, so the same rejection is fatal again.
+    const second = fakeProc()
+    installFailLoud(NAME, second)
+    second.handlers[0]!(owned)
+    expect(second.written[0]).toContain('sandbox escape')
+    expect(second.exits).toEqual([1])
   })
 
   it('does not report an activation rejection shared by entries in the boot audit', async () => {

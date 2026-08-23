@@ -135,12 +135,36 @@ export class DynamicCordisRunnerService extends TypertRemoteService {
   private readonly resolved: ResolvedConfig
   private group: Fiber | undefined
 
+  /**
+   * Claim unhandled rejections that originate inside this runner's vm sandboxes
+   * (`cordis-dyn-<pluginId>.js` stack frames). Model-written Packages can leave
+   * floating promises whose rejections never cross a fiber error route;
+   * unclaimed, the process-wide fail-loud guard treats them as fatal and takes
+   * the whole app down (a self-modification Package must not be able to brick
+   * the Host). A claimed rejection flows through the same recovery channel as
+   * fiber guard failures: logged, and steered into the owning session so the
+   * model can correct the Package with cordis_run mode:"update".
+   */
+  private readonly claimUnhandledRejection = (reason: unknown): boolean => {
+    const pluginId = dynamicPluginIdFromReason(reason)
+    if (pluginId === undefined) return false
+    const plugin = this.registry.get(pluginId)
+    if (plugin === undefined || plugin.run === undefined) return false
+    const failure = errorDetails(reason)
+    this.rootCtx.logger.error(
+      `dynamic plugin ${plugin.pluginId}/${plugin.run.packageId} (${plugin.run.pluginRunId}) left an unhandled rejection: ${failure.message}`,
+    )
+    this.steerGuardFailure(plugin, plugin.run, 'Host', failure)
+    return true
+  }
+
   /** Create the service under the Host composition. */
   constructor(ctx: Context, config: Config) {
     super(ctx, 'dynamicCordisRunner')
     this.rootCtx = ctx
     this.resolved = config as ResolvedConfig
     this.inspectRegistry = new CordisInspectRegistryService(ctx)
+    ctx.effect(() => addFailLoudClaim(this.claimUnhandledRejection), 'dynamicCordisRunner fail-loud claim')
   }
 
   /**
@@ -1255,6 +1279,42 @@ function errorDetails(error: unknown): CordisErrorDetails {
     : Object.prototype.toString.call(error)
   const stack = 'stack' in error && typeof error.stack === 'string' ? error.stack : undefined
   return { message, ...stack === undefined ? {} : { stack } }
+}
+
+/** vm filenames assigned to dynamic plugin code (`cordis-dyn-<pluginId>.js`) and its parse probes. */
+const DYNAMIC_PLUGIN_FRAME = /cordis-dyn-([a-z][a-z0-9-]*)\.js/
+
+/**
+ * The plugin whose sandbox code threw, from the rejection's own stack. The
+ * first `cordis-dyn-*.js` frame is the nearest throw site; the parse-probe
+ * filenames (`cordis-dyn-code.host.js`, which never executes) simply fail the
+ * registry lookup downstream. Non-sandbox rejections return undefined.
+ */
+function dynamicPluginIdFromReason(reason: unknown): CordisDynamicPluginId | undefined {
+  if (!(reason instanceof Error) || typeof reason.stack !== 'string') return undefined
+  const pluginId = reason.stack.match(DYNAMIC_PLUGIN_FRAME)?.[1]
+  return pluginId === undefined ? undefined : CordisDynamicPluginId(pluginId)
+}
+
+/**
+ * The fail-loud claim registry app-boot's `installFailLoud` consults. This
+ * package must not depend on `@deepseek-ai/dsh-app-boot` (boot composes
+ * extensions, never the reverse), so both sides bind the same registry through
+ * the `Symbol.for` key — keep the literal in sync with app-boot's
+ * `registerFailLoudClaim`.
+ */
+const FAIL_LOUD_CLAIMS = Symbol.for('dsh.failLoudClaims')
+
+type FailLoudClaimant = (reason: unknown) => boolean
+
+function addFailLoudClaim(claim: FailLoudClaimant): () => void {
+  const holder = globalThis as { [key: symbol]: FailLoudClaimant[] | undefined }
+  const claims = (holder[FAIL_LOUD_CLAIMS] ??= [])
+  claims.push(claim)
+  return () => {
+    const index = claims.indexOf(claim)
+    if (index >= 0) claims.splice(index, 1)
+  }
 }
 
 function formatErrorDetails(failure: CordisErrorDetails): string {

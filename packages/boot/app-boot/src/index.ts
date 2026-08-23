@@ -572,6 +572,43 @@ async function observeLoaderRejectionCheckpoint(reasons: readonly unknown[]): Pr
 }
 
 /**
+ * Global key under which long-lived runtimes register fail-loud claim handlers.
+ * Computed with `Symbol.for` (not a plain `Symbol`) because claimants live in
+ * other workspace packages that must not depend on this one — both sides bind
+ * the same registry by key. Keep the literal in sync with cordis-host-runner's
+ * registration comment.
+ */
+const FAIL_LOUD_CLAIMS: unique symbol = Symbol.for('dsh.failLoudClaims')
+
+/**
+ * A claimant takes responsibility for one unhandled rejection: it returns true
+ * only when it has reported the rejection through its own channel, and
+ * {@link installFailLoud} then defers instead of exiting. Anything else stays
+ * fatal — a claim must narrow the blast radius of a known, reported failure
+ * mode, never widen it into silent rejection swallowing.
+ */
+export type FailLoudClaim = (reason: unknown) => boolean
+
+function failLoudClaims(): FailLoudClaim[] {
+  const holder = globalThis as typeof globalThis & { [FAIL_LOUD_CLAIMS]: FailLoudClaim[] | undefined }
+  return (holder[FAIL_LOUD_CLAIMS] ??= [])
+}
+
+/**
+ * Register a {@link FailLoudClaim} for the rest of the process. The returned
+ * disposer removes the claim; the registry itself lives on `globalThis` so
+ * packages that cannot import this module can register through the same key.
+ */
+export function registerFailLoudClaim(claim: FailLoudClaim): () => void {
+  const claims = failLoudClaims()
+  claims.push(claim)
+  return () => {
+    const index = claims.indexOf(claim)
+    if (index >= 0) claims.splice(index, 1)
+  }
+}
+
+/**
  * How long {@link installFailLoud} waits for its `release` hook before exiting
  * anyway. A wedged disposer must delay the fatal exit, never cancel it.
  */
@@ -599,6 +636,12 @@ export const FAIL_LOUD_RELEASE_TIMEOUT_MS = 2_000
  * the process mid-teardown, stranding exactly the terminal state this restores —
  * so a latch keeps the first rejection the reported one and lets later
  * rejections (including the release's own) fall through to the pending exit.
+ *
+ * Rejections matched by a registered {@link FailLoudClaim} (see
+ * {@link registerFailLoudClaim}) are skipped: the claimant has reported them
+ * through its own channel and owns the outcome. Claimed rejections are checked
+ * before the latch, so a runtime that claims one keeps the process alive for
+ * its own recovery flow.
  * @param binName - the diagnostic prefix on the fatal-failure line.
  * @param proc - the process slice to register on; tests inject a fake.
  * @param release - optional teardown awaited before exit, used by a
@@ -614,6 +657,7 @@ export function installFailLoud(
   let exiting = false
   const handler = (err: unknown): void => {
     if (assembledActivationRejections.has(err)) return
+    if (failLoudClaims().some(claim => claim(err))) return
     // A release in flight already owns the exit. Swallow later rejections
     // (teardown's own included) rather than reporting a second failure over the
     // real one or letting Node kill the process before the terminal is back.
