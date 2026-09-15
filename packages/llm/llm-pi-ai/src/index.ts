@@ -183,7 +183,8 @@ export function apply(ctx: Context, config: Config): void {
     throw new LlmError(
       `llm-pi-ai: no credential for provider route "${provider}"; its profile resolves ${ref}, which is not`
       + ` set — store ${ref} through the credentials service (the web Models page writes it) or export it,`
-      + ' and remove apiKeyEnv only if this provider should authenticate from pi-ai\'s own environment discovery',
+      + ' and remove apiKeyEnv only if this route authenticates another way: pi-ai\'s own environment'
+      + ' discovery, a profile header, or keyless for a local server',
       'MISSING_CREDENTIAL',
     )
   }

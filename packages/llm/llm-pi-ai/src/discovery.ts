@@ -19,6 +19,16 @@
  * that it cannot be interrogated so the surface falls back to hand-entry
  * rather than guessing a response shape.
  *
+ * One gap that listing shape cannot close: a self-hosted server names its
+ * models but discloses no capacity for them, so a surface adopting the rows
+ * guesses a context window — and a local server serves the context it loaded,
+ * which is usually a fraction of what the model supports. When the OpenAI
+ * listing adopted no capacity at all, a best-effort second pass asks the same
+ * endpoint's own native listing (LM Studio serves `/api/v0/models` beside its
+ * `/v1` one) for the truth. That pass never fails a reply that already
+ * succeeded: an endpoint without the native listing, or one whose reply is
+ * not the expected shape, keeps the OpenAI listing's rows unchanged.
+ *
  * @module dsh-llm-pi-ai/discovery
  */
 
@@ -59,6 +69,23 @@ interface ListingEntry {
   context_length?: unknown
   max_tokens?: unknown
   max_output_tokens?: unknown
+}
+
+/**
+ * One entry of a native `GET /api/v0/models` reply, the listing LM Studio
+ * serves beside its OpenAI-compatible one. Only the fields this module reads
+ * are named; the shape is validated by content, so another server that
+ * happens to answer the same path is read only through fields it genuinely
+ * carries.
+ */
+interface NativeEntry {
+  id?: unknown
+  /** LM Studio's kind for the row: `llm`, `vlm`, or `embeddings`. */
+  type?: unknown
+  /** Context the model supports at most. */
+  max_context_length?: unknown
+  /** Context the server actually loaded, when the model is loaded. */
+  loaded_context_length?: unknown
 }
 
 /** A positive integer field of a listing entry, or `undefined` when absent or unusable. */
@@ -134,8 +161,12 @@ async function readBounded(response: Response, url: string): Promise<string> {
  * Read one OpenAI-compatible listing reply. Entries without a usable id are
  * skipped rather than failing the whole interrogation: a single malformed row
  * should not deny the user the rest of a working endpoint's catalog.
+ * @param body - the parsed reply body.
+ * @returns the adopted rows, and whether any of them disclosed a context
+ * window — the fact that decides whether the native-listing pass is worth a
+ * second request.
  */
-function readListing(body: unknown): LlmDiscoveredModel[] {
+function readListing(body: unknown): { models: LlmDiscoveredModel[]; disclosedContext: boolean } {
   const data = (body as { data?: unknown } | null)?.data
   if (!Array.isArray(data)) {
     throw new LlmError(
@@ -144,6 +175,7 @@ function readListing(body: unknown): LlmDiscoveredModel[] {
     )
   }
   const models: LlmDiscoveredModel[] = []
+  let disclosedContext = false
   for (const raw of data) {
     const entry = raw as ListingEntry | null
     const id = label(entry?.id)
@@ -151,6 +183,7 @@ function readListing(body: unknown): LlmDiscoveredModel[] {
     const name = label(entry?.name, entry?.display_name)
     const contextWindow = capacity(entry?.context_window, entry?.context_length)
     const maxTokens = capacity(entry?.max_output_tokens, entry?.max_tokens)
+    disclosedContext ||= contextWindow !== undefined
     models.push({
       id,
       ...name === undefined ? {} : { name },
@@ -158,7 +191,7 @@ function readListing(body: unknown): LlmDiscoveredModel[] {
       ...maxTokens === undefined ? {} : { maxTokens },
     })
   }
-  return models
+  return { models, disclosedContext }
 }
 
 /**
@@ -280,5 +313,97 @@ export async function discoverModels(
   } catch (error: unknown) {
     throw new LlmError(`${url} did not answer with JSON`, 'DISCOVERY_FAILED', { cause: error })
   }
-  return readListing(body)
+  const { models, disclosedContext } = readListing(body)
+  if (!disclosedContext) return enrichFromNativeListing(request, models, apiKey)
+  return models
+}
+
+/**
+ * Where the same server's native listing lives, when the OpenAI base points
+ * at one. LM Studio serves `/api/v0/models` at its root while its
+ * OpenAI-compatible base is `/v1`, so the one trailing `/v1` segment is
+ * dropped from the configured base; every other base keeps its segments, which
+ * is also what a proxied deployment wants — its root is wherever its own
+ * `/v1` hangs.
+ * @param baseURL - the configured OpenAI-compatible base.
+ * @returns the native listing URL beside it.
+ */
+function nativeListingUrl(baseURL: string): string {
+  const trimmed = baseURL.replace(/\/+$/, '')
+  return `${/\/v1$/.test(trimmed) ? trimmed.slice(0, -3) : trimmed}/api/v0/models`
+}
+
+/**
+ * The context one adopted row can actually use, from the native listing's row
+ * for it. What the server loaded wins over what the model supports at most,
+ * because the loaded figure is the ceiling a request can reach today — a
+ * model that supports 262k served at 119k must be configured as 119k or its
+ * sessions overflow the load, not the model.
+ * @param entry - the native row, when the reply carried one for the id.
+ * @returns the usable context, or `undefined` when the row states none.
+ */
+function nativeContext(entry: NativeEntry | undefined): number | undefined {
+  if (entry === undefined) return undefined
+  // An embeddings row is not a chat model: adopting its tiny context would
+  // hand a conversation model the embedding model's limit.
+  if (entry.type !== 'llm' && entry.type !== 'vlm') return undefined
+  return capacity(entry.loaded_context_length, entry.max_context_length)
+}
+
+/**
+ * Fill in the context windows a bare OpenAI listing left out, from the same
+ * endpoint's native listing. Best-effort by construction: every way this
+ * second request can fail — the path is absent, the reply is not the expected
+ * shape, the caller aborted mid-read — keeps the already-successful listing's
+ * rows exactly as they were, because enrichment may only improve a reply that
+ * already stands on its own.
+ * @param request - the interrogation this pass serves, for its signal.
+ * @param models - the rows the OpenAI listing adopted.
+ * @param apiKey - the credential the first request used, sent again so a
+ * server that demanded it for `/v1/models` is not asked unauthenticated now.
+ * @returns the rows, with `contextWindow` filled where the native listing
+ * disclosed one for that id.
+ */
+async function enrichFromNativeListing(
+  request: LlmModelDiscoveryRequest,
+  models: readonly LlmDiscoveredModel[],
+  apiKey: string | undefined,
+): Promise<readonly LlmDiscoveredModel[]> {
+  // An empty listing leaves nothing to enrich, and a second request that
+  // cannot change the reply is a second request the endpoint never owed.
+  if (models.length === 0) return models
+  const nativeUrl = nativeListingUrl(request.baseURL ?? '')
+  try {
+    const response = await fetch(nativeUrl, {
+      method: 'GET',
+      headers: {
+        accept: 'application/json',
+        ...apiKey === undefined ? {} : { authorization: `Bearer ${apiKey}` },
+        ...attributionHeaders(),
+      },
+      ...request.signal === undefined ? {} : { signal: request.signal },
+    })
+    if (!response.ok) return models
+    const body: unknown = JSON.parse(await readBounded(response, nativeUrl))
+    const data = (body as { data?: unknown } | null)?.data
+    if (!Array.isArray(data)) return models
+    const contexts = new Map<string, number>()
+    for (const raw of data) {
+      const entry = raw as NativeEntry | null
+      const id = label(entry?.id)
+      const context = nativeContext(entry ?? undefined)
+      if (id === undefined || context === undefined) continue
+      contexts.set(id, context)
+    }
+    if (contexts.size === 0) return models
+    return models.map((model) => {
+      const context = contexts.get(model.id)
+      return context === undefined || model.contextWindow !== undefined ? model : { ...model, contextWindow: context }
+    })
+  } catch {
+    // Anything the enrichment path throws — unreachable path, foreign reply,
+    // a caller that aborted after the listing succeeded — is not a fault in
+    // the reply being enriched.
+    return models
+  }
 }

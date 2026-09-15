@@ -28,18 +28,31 @@ interface ListingServer {
 /**
  * A stand-in provider that answers one scripted `GET /models`. `chunks` writes
  * without a declared length, which is how a real streamed reply arrives.
+ * `routes` answers specific paths differently, which is how a server that
+ * serves a native listing beside its OpenAI-compatible one is stood up.
  */
 async function listingServer(behavior: {
   status?: number
   body?: string
   chunks?: string[]
   holdOpenMs?: number
+  routes?: Record<string, { status?: number; body?: string }>
 }): Promise<ListingServer> {
   const paths: string[] = []
   const headers: IncomingMessage['headers'][] = []
   const server = createServer((request: IncomingMessage, response: ServerResponse) => {
     paths.push(request.url ?? '')
     headers.push(request.headers)
+    const routed = behavior.routes?.[request.url ?? '']
+    if (routed !== undefined) {
+      const routeBody = routed.body ?? '{}'
+      response.writeHead(routed.status ?? 200, {
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(routeBody)),
+      })
+      response.end(routeBody)
+      return
+    }
     if (behavior.chunks !== undefined) {
       // No declared length: the ceiling has to hold on what is read.
       response.writeHead(behavior.status ?? 200, { 'content-type': 'application/json' })
@@ -134,7 +147,9 @@ describe('draft-provider model discovery', () => {
 
     await ctx.llm.discoverModels('llm-pi-ai', { baseURL: `${server.url}/openai/v1/` })
 
-    expect(server.paths).toEqual(['/openai/v1/models'])
+    // The bare listing adopted no capacity, so the native-listing pass probes
+    // the same server's own listing beside the base it kept.
+    expect(server.paths).toEqual(['/openai/v1/models', '/openai/api/v0/models'])
   })
 
   it('offers no credential when the draft names none', async () => {
@@ -150,8 +165,12 @@ describe('draft-provider model discovery', () => {
     // What the Models page actually sends after a key is saved: the form holds
     // the redacted descriptor, so the draft names the route and the endpoint
     // and no credential at all. Interrogating unauthenticated would answer 401
-    // and read as a wrong key.
-    const server = await listingServer({ body: JSON.stringify({ data: [{ id: 'm' }] }) })
+    // and read as a wrong key. The row carries a capacity so the listing
+    // answers in one request: this test pins the credential path, not the
+    // native-listing pass a bare listing would add beside it.
+    const server = await listingServer({
+      body: JSON.stringify({ data: [{ id: 'm', context_length: 8192 }] }),
+    })
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)
     process.env['ACME_GATEWAY_KEY'] = 'stored-key'
@@ -330,6 +349,106 @@ describe('draft-provider model discovery', () => {
 
     await expect(ctx.llm.discoverModels('llm-pi-ai', { provider: 'openai' }))
       .rejects.toMatchObject({ code: 'NO_DISCOVERY' })
+  })
+})
+
+describe('native listing enrichment', () => {
+  /**
+   * A stand-in local server: an OpenAI-compatible listing that names its
+   * models and discloses nothing else, beside LM Studio's own listing that
+   * carries the truth about context.
+   */
+  async function localServer(native: { status?: number; body?: string }): Promise<ListingServer> {
+    return listingServer({
+      body: JSON.stringify({
+        data: [
+          { id: 'qwen/qwen3.8-27b', object: 'model', owned_by: 'organization_owner' },
+          { id: 'ornith-1.5-35b-a3b-mlx', object: 'model', owned_by: 'organization_owner' },
+          { id: 'text-embedding-nomic-embed-text-v1.5', object: 'model', owned_by: 'organization_owner' },
+        ],
+      }),
+      routes: { '/api/v0/models': native },
+    })
+  }
+
+  it('adopts the context a local server discloses beside its OpenAI listing', async () => {
+    const server = await localServer({
+      body: JSON.stringify({
+        data: [
+          // Loaded wins: the model supports 262k but the server serves 119k.
+          {
+            id: 'qwen/qwen3.8-27b',
+            type: 'vlm',
+            max_context_length: 262_144,
+            loaded_context_length: 119_552,
+            state: 'loaded',
+          },
+          // Not loaded, so the model's maximum is the only fact offered.
+          { id: 'ornith-1.5-35b-a3b-mlx', type: 'llm', max_context_length: 98_304, state: 'not-loaded' },
+          // An embeddings row is not a conversation model; its 2k context
+          // must not be adopted as one.
+          { id: 'text-embedding-nomic-embed-text-v1.5', type: 'embeddings', max_context_length: 2048 },
+        ],
+      }),
+    })
+    const ctx = await harness()
+
+    const models = await ctx.llm.discoverModels('llm-pi-ai', { baseURL: `${server.url}/v1`, apiKey: 'probe-key' })
+
+    expect(models).toEqual([
+      { id: 'qwen/qwen3.8-27b', contextWindow: 119_552 },
+      { id: 'ornith-1.5-35b-a3b-mlx', contextWindow: 98_304 },
+      { id: 'text-embedding-nomic-embed-text-v1.5' },
+    ])
+    // The native probe authenticates the same way the listing request did.
+    expect(server.paths).toEqual(['/v1/models', '/api/v0/models'])
+    expect(server.headers[1]?.authorization).toBe('Bearer probe-key')
+  })
+
+  it('keeps the listing when the endpoint has no native listing to read', async () => {
+    const server = await localServer({ status: 404, body: '{"error":"nope"}' })
+    const ctx = await harness()
+
+    const models = await ctx.llm.discoverModels('llm-pi-ai', { baseURL: `${server.url}/v1` })
+
+    // A bare listing stays exactly what it was; enrichment only improves a
+    // reply that already stands on its own.
+    expect(models).toEqual([
+      { id: 'qwen/qwen3.8-27b' },
+      { id: 'ornith-1.5-35b-a3b-mlx' },
+      { id: 'text-embedding-nomic-embed-text-v1.5' },
+    ])
+  })
+
+  it('keeps the listing when the native reply is a foreign shape', async () => {
+    const server = await localServer({
+      body: JSON.stringify({ data: [{ id: 'qwen/qwen3.8-27b' }, { id: 'ornith-1.5-35b-a3b-mlx' }] }),
+    })
+    const ctx = await harness()
+
+    const models = await ctx.llm.discoverModels('llm-pi-ai', { baseURL: `${server.url}/v1` })
+
+    // Rows without the native fields adopt nothing, and a native reply that
+    // is not a `{data}` array at all is left alone the same way.
+    expect(models).toEqual([
+      { id: 'qwen/qwen3.8-27b' },
+      { id: 'ornith-1.5-35b-a3b-mlx' },
+      { id: 'text-embedding-nomic-embed-text-v1.5' },
+    ])
+
+    const shapeless = await localServer({ body: '{"models":[]}' })
+    await expect(ctx.llm.discoverModels('llm-pi-ai', { baseURL: `${shapeless.url}/v1` })).resolves.toHaveLength(3)
+  })
+
+  it('asks no second request when the listing already disclosed its capacities', async () => {
+    const server = await listingServer({
+      body: JSON.stringify({ data: [{ id: 'acme-large', context_length: 65_536 }] }),
+    })
+    const ctx = await harness()
+
+    await ctx.llm.discoverModels('llm-pi-ai', { baseURL: `${server.url}/v1` })
+
+    expect(server.paths).toEqual(['/v1/models'])
   })
 })
 
